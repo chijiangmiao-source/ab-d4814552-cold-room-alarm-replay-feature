@@ -27,6 +27,15 @@ type event struct {
 	OccurredAt string `json:"occurred_at"`
 }
 
+// activeDoor 是 GET /api/doors/active 的一行。
+type activeDoor struct {
+	DoorID         string `json:"door_id"`
+	StartSeq       int64  `json:"start_seq"`
+	LastSeq        int64  `json:"last_seq"`
+	LastKind       string `json:"last_kind"`
+	LastOccurredAt string `json:"last_occurred_at"`
+}
+
 type failures []string
 
 func (f *failures) check(cond bool, msg string, args ...any) {
@@ -52,7 +61,8 @@ func main() {
 
 	var fails failures
 	run := fmt.Sprintf("verify-%d", time.Now().UnixNano())
-	const doorID = "verify-door"
+	// 门号带本次运行前缀：未关闭门视图按门号聚合，避免与并行的其它验收运行互相干扰。
+	doorID := "verify-door-" + run
 	mk := func(id, kind, at string) event {
 		return event{EventID: run + "-" + id, DoorID: doorID, Kind: kind, OccurredAt: at}
 	}
@@ -139,6 +149,9 @@ func main() {
 	cl2 := mustPost(client, &fails, base, mk("clock-early", "CLOSED", "2026-12-31T00:00:00Z"))
 	fails.check(cl2.Seq == cl1.Seq+1, "排序只看服务端 seq，与设备时间无关：%d -> %d", cl1.Seq, cl2.Seq)
 
+	// ---- 9. “未关闭门”视图：开段、刷新、重复不变、关闭消失，顺序按开始序号 ----
+	checkActiveDoors(client, &fails, base, run)
+
 	if len(fails) == 0 {
 		fmt.Println("verify: 全部通过 ✔  回调幂等、序号连续不复用、断线补发与实时推送均恰好一次")
 		os.Exit(0)
@@ -148,6 +161,107 @@ func main() {
 	}
 	fmt.Printf("verify: %d 项失败\n", len(fails))
 	os.Exit(1)
+}
+
+// checkActiveDoors 对“未关闭门”视图做一轮独立验收（门号含本次运行前缀，
+// 不与并行运行冲突）：异常开段后能查到、重复回调不改变结果、关闭后消失；
+// 并验证两门同时开启时按开始序号固定排序。
+func checkActiveDoors(client *http.Client, fails *failures, base, run string) {
+	d1 := "door-p1-" + run
+	d2 := "door-p2-" + run
+
+	o1 := mustPost(client, fails, base, event{
+		EventID: run + "-panel-open1", DoorID: d1, Kind: "OPEN_TOO_LONG",
+		OccurredAt: "2026-09-14T22:30:00Z",
+	})
+	// d1 随后强制开门：开始序号不变，最近类型/序号/设备时间刷新。
+	o2 := mustPost(client, fails, base, event{
+		EventID: run + "-panel-open2", DoorID: d1, Kind: "FORCED_OPEN",
+		OccurredAt: "2026-09-14T22:35:00Z",
+	})
+	// d2 在其后开段，但开始序号更大，应排在 d1 之后。
+	o3 := mustPost(client, fails, base, event{
+		EventID: run + "-panel-open3", DoorID: d2, Kind: "FORCED_OPEN",
+		OccurredAt: "2026-09-14T22:36:00Z",
+	})
+
+	doors := fetchActiveDoors(client, fails, base)
+	i1, ok1 := findActive(doors, d1)
+	i2, ok2 := findActive(doors, d2)
+	fails.check(ok1 && ok2, "未关闭门：开段后两扇门都应在列表里（%d 条记录）", len(doors))
+	if ok1 && ok2 {
+		fails.check(i1 < i2, "未关闭门：应按开始序号排序，d1(start=%d) 必须在 d2(start=%d) 之前，实际位置 %d/%d",
+			o1.Seq, o3.Seq, i1, i2)
+		row := doors[i1]
+		fails.check(row.StartSeq == o1.Seq && row.LastSeq == o2.Seq && row.LastKind == "FORCED_OPEN" &&
+			row.LastOccurredAt == "2026-09-14T22:35:00Z",
+			"未关闭门：d1 开始/最近序号与最近类型应刷新：%+v", row)
+	}
+
+	// 重复回调（字段不同）不改变视图。
+	if _, code, _ := postJSON(client, fails, base, event{
+		EventID: run + "-panel-open1", DoorID: d1, Kind: "CLOSED",
+		OccurredAt: "2026-09-14T23:00:00Z",
+	}); code != http.StatusOK {
+		fails.check(false, "未关闭门：重复回调应返回 200，实际 %d", code)
+	}
+	doors = fetchActiveDoors(client, fails, base)
+	if i, ok := findActive(doors, d1); ok {
+		row := doors[i]
+		fails.check(row.LastSeq == o2.Seq && row.LastKind == "FORCED_OPEN",
+			"未关闭门：重复回调不得改变状态：%+v", row)
+	} else {
+		fails.check(false, "未关闭门：重复回调不应让 d1 消失")
+	}
+
+	// 关闭 d1：只剩 d2。
+	mustPost(client, fails, base, event{
+		EventID: run + "-panel-close1", DoorID: d1, Kind: "CLOSED",
+		OccurredAt: "2026-09-14T22:40:00Z",
+	})
+	doors = fetchActiveDoors(client, fails, base)
+	_, stillThere := findActive(doors, d1)
+	_, d2There := findActive(doors, d2)
+	fails.check(!stillThere && d2There, "未关闭门：关闭 d1 后应只剩 d2（%d 条记录）", len(doors))
+
+	// 关闭 d2：用本运行前缀的门全部结束，列表中不应再有本次运行的门。
+	mustPost(client, fails, base, event{
+		EventID: run + "-panel-close2", DoorID: d2, Kind: "CLOSED",
+		OccurredAt: "2026-09-14T22:41:00Z",
+	})
+	doors = fetchActiveDoors(client, fails, base)
+	for _, d := range doors {
+		fails.check(!strings.HasPrefix(d.DoorID, "door-p"),
+			"未关闭门：全部关闭后本运行的门不应残留：%s", d.DoorID)
+	}
+}
+
+func fetchActiveDoors(client *http.Client, fails *failures, base string) []activeDoor {
+	resp, err := client.Get(base + "/api/doors/active")
+	if err != nil {
+		fails.check(false, "GET /api/doors/active 请求失败: %v", err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fails.check(false, "GET /api/doors/active 应返回 200，实际 %d", resp.StatusCode)
+		return nil
+	}
+	var doors []activeDoor
+	if err := json.NewDecoder(resp.Body).Decode(&doors); err != nil {
+		fails.check(false, "未关闭门响应解析失败: %v", err)
+		return nil
+	}
+	return doors
+}
+
+func findActive(doors []activeDoor, doorID string) (int, bool) {
+	for i, d := range doors {
+		if d.DoorID == doorID {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 func waitHealthy(client *http.Client, base string) error {

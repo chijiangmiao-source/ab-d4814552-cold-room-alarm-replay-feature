@@ -159,3 +159,125 @@ test('新页面打开时从序号 0 完整补发历史', async ({ browser, reque
   await expect(page.getByTestId('completeness')).toContainText('序号连续')
   await ctx.close()
 })
+
+// “未关闭门”视图：两门告警 → 关闭其一 → 断线补发，面板始终只剩另一门，
+// 时间线每条告警仍只出现一次。
+test('未关闭门面板随实时告警与断线补发更新，关闭一门后只剩另一门', async ({ browser, request }) => {
+  const ctx = await browser.newContext()
+  const page = await ctx.newPage()
+  await openConsole(page)
+
+  const door1 = `${RUN}-panel-A`
+  const door2 = `${RUN}-panel-B`
+  const door3 = `${RUN}-panel-gap`
+  const panelDoor = (id) => page.locator(`[data-testid="active-door"][data-door-id="${id}"]`)
+
+  // 两门先后告警，页面在线：实时收到告警后自动刷新面板。
+  const a = await postEvent(request, `${RUN}-panel-open-a`, 'OPEN_TOO_LONG', { door_id: door1 })
+  const b = await postEvent(request, `${RUN}-panel-open-b`, 'FORCED_OPEN', { door_id: door2 })
+  await waitForEventId(page, `${RUN}-panel-open-b`)
+
+  await expect(page.getByTestId('active-count')).toHaveText('2')
+  const rows = page.getByTestId('active-door')
+  await expect(rows).toHaveCount(2)
+  // 按异常开始序号排列：door1 在前。
+  await expect(rows.first()).toHaveAttribute('data-door-id', door1)
+  await expect(panelDoor(door1)).toContainText('开门超时')
+  await expect(panelDoor(door1)).toContainText(`开始 #${a.ev.seq}`)
+  await expect(panelDoor(door2)).toContainText('强制开门')
+  await expect(panelDoor(door2)).toContainText(`开始 #${b.ev.seq}`)
+
+  // 关闭其中一门：实时刷新后面板只剩另一门。
+  const closeA = await postEvent(request, `${RUN}-panel-close-a`, 'CLOSED', { door_id: door1 })
+  await waitForEventId(page, `${RUN}-panel-close-a`)
+  await expect(panelDoor(door1)).toHaveCount(0)
+  await expect(panelDoor(door2)).toHaveCount(1)
+  await expect(page.getByTestId('active-count')).toHaveText('1')
+
+  // 模拟中控断网：断线期间让 door2 再报一次（类型变化、序号推进），
+  // 另有一门在断线窗口内“开了又关”，补发校准后不得残留在面板。
+  await ctx.setOffline(true)
+  await page.waitForTimeout(1500)
+  const gap = [
+    await postEvent(request, `${RUN}-panel-gap-update`, 'OPEN_TOO_LONG', { door_id: door2 }),
+    await postEvent(request, `${RUN}-panel-gap-open`, 'FORCED_OPEN', { door_id: door3 }),
+    await postEvent(request, `${RUN}-panel-gap-close`, 'CLOSED', { door_id: door3 }),
+  ]
+  await ctx.setOffline(false)
+
+  // 断线补发完成：连接状态回到实时，最后序号追上。
+  await expect(page.getByTestId('conn-badge')).toHaveText('实时', { timeout: 20_000 })
+  for (const { ev } of gap) {
+    await waitForEventId(page, ev.event_id)
+  }
+  await expect(page.getByTestId('last-seq')).toContainText(`#${gap[2].ev.seq}`)
+
+  // 面板校准：只剩 door2，且开始序号仍是最早那次、最近类型/序号已更新。
+  await expect(page.getByTestId('active-count')).toHaveText('1')
+  await expect(page.getByTestId('active-door')).toHaveCount(1)
+  await expect(panelDoor(door1)).toHaveCount(0)
+  await expect(panelDoor(door3)).toHaveCount(0)
+  await expect(panelDoor(door2)).toHaveCount(1)
+  await expect(panelDoor(door2)).toContainText('开门超时')
+  await expect(panelDoor(door2)).toContainText(`开始 #${b.ev.seq}`)
+  await expect(panelDoor(door2)).toContainText(`最近 #${gap[0].ev.seq}`)
+
+  // 时间线完整性：本场景每条告警恰好一张卡片，序号连续、无缺号。
+  const scenarioIds = [
+    `${RUN}-panel-open-a`, `${RUN}-panel-open-b`, `${RUN}-panel-close-a`,
+    `${RUN}-panel-gap-update`, `${RUN}-panel-gap-open`, `${RUN}-panel-gap-close`,
+  ]
+  for (const id of scenarioIds) {
+    await expect(page.locator(`article.event[data-event-id="${id}"]`)).toHaveCount(1)
+  }
+  await expect(page.getByTestId('completeness')).toContainText('序号连续')
+
+  // 收尾：关掉最后一扇门，保证本运行不留残余，便于在同一数据库上重复执行。
+  const cleanup = await postEvent(request, `${RUN}-panel-cleanup`, 'CLOSED', { door_id: door2 })
+  await waitForEventId(page, `${RUN}-panel-cleanup`)
+  await expect(page.getByTestId('last-seq')).toContainText(`#${cleanup.ev.seq}`)
+  await expect(panelDoor(door2)).toHaveCount(0)
+  await expect(page.getByTestId('active-count')).toHaveText('0')
+
+  await ctx.close()
+})
+
+// 快照加载失败只影响面板本身：时间线告警流与完整性判断照常工作，
+// 点击“重试”且接口恢复后面板回到正常。
+test('未关闭门快照加载失败时只在面板提示并可重试，不中断告警流', async ({ browser, request }) => {
+  const ctx = await browser.newContext()
+  const page = await ctx.newPage()
+
+  // 打开页面之前先拦截只读快照接口：主动失败，SSE 通道不受影响。
+  await page.route('**/api/doors/active', (route) => route.abort('failed'))
+  await page.goto('/')
+  await expect(page.getByTestId('conn-badge')).toBeVisible()
+
+  await expect(page.getByTestId('active-error')).toBeVisible({ timeout: 15_000 })
+  await expect(page.getByTestId('active-error')).toContainText('未关闭门视图加载失败')
+  // 页面级错误条不应出现——告警流没被打断。
+  await expect(page.getByTestId('error')).toHaveCount(0)
+
+  // 快照接口挂掉期间，实时告警与完整性自检照常工作。
+  const doorX = `${RUN}-panel-fail`
+  const { ev } = await postEvent(request, `${RUN}-panel-fail-open`, 'FORCED_OPEN', { door_id: doorX })
+  const row = await waitForEventId(page, `${RUN}-panel-fail-open`)
+  await expect(row).toContainText(`#${ev.seq}`)
+  await expect(page.getByTestId('last-seq')).toContainText(`#${ev.seq}`)
+  await expect(page.getByTestId('completeness')).toContainText('序号连续')
+  // 面板仍在报错，没有伪装成数据。
+  await expect(page.getByTestId('active-error')).toBeVisible()
+
+  // 接口恢复后点重试：面板正常显示该门，错误消失。
+  await page.unroute('**/api/doors/active')
+  await page.getByTestId('active-retry').click()
+  await expect(page.getByTestId('active-error')).toHaveCount(0)
+  await expect(page.locator(`[data-testid="active-door"][data-door-id="${doorX}"]`)).toBeVisible()
+
+  // 收尾关门，保持数据库干净。
+  const cleanup = await postEvent(request, `${RUN}-panel-fail-close`, 'CLOSED', { door_id: doorX })
+  await waitForEventId(page, `${RUN}-panel-fail-close`)
+  await expect(page.getByTestId('last-seq')).toContainText(`#${cleanup.ev.seq}`)
+
+  await ctx.close()
+})
