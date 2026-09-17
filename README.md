@@ -10,7 +10,8 @@
 ```
 设备网关 ──POST JSON──▶ Go API ──写入──▶ SQLite（严格递增、永不复用的服务端序号）
                           │
-                          └──SSE──▶ Vue 中控页面（按序号显示，断线带最后序号重连）
+                          ├──SSE 告警流──▶ Vue 中控页面（按序号显示，断线带最后序号重连）
+Vue 中控页面 ──GET /api/doors/active──▶ Go API（未关闭门：接班加载、实时/补发后校准）
 ```
 
 ## 快速开始（Docker Compose）
@@ -155,7 +156,37 @@ data: {"last_seq":43}
 curl -N "http://localhost:8080/api/events/stream?last_seq=0"
 ```
 
-### 3. 健康检查：`GET /healthz` → `200 {"status":"ok"}`
+### 3. 未关闭门视图：`GET /api/doors/active`（只读）
+
+值班员接班时不必逐条翻告警，直接拿到**仍处于异常开启、尚未 CLOSED** 的门：
+
+```bash
+curl http://localhost:8080/api/doors/active
+```
+
+```json
+[
+  {
+    "door_id": "door-A1",
+    "start_seq": 13,
+    "last_seq": 16,
+    "last_kind": "FORCED_OPEN",
+    "last_occurred_at": "2026-09-14T22:11:00Z"
+  }
+]
+```
+
+- 每扇门一行：门号、异常**开始序号**、**最近序号**、最近告警类型、最近设备时间；
+  序号直接复用服务端 `seq`，设备时间仍只用于展示。
+- 按异常开始序号升序（最早异常的门排最前）；没有未关闭门时返回 `200 []`。
+- 异常时段在与事件入库**同一 SQLite 事务**中维护：
+  首次接受的 `OPEN_TOO_LONG`/`FORCED_OPEN` 开段，同门后续异常告警只刷新最近类型/序号，
+  `CLOSED` 结束该时段（之后再开是新段）；重复 `event_id` 不改变任何结果。
+- 服务启动时若发现旧库（升级前的库），会按 `seq` 从既有事件回算一次初始视图，
+  回算结果幂等，之后由写入路径持续维护。
+- 查询失败返回与事件接口一致的 JSON 错误结构（`{"error": ...}`）。
+
+### 4. 健康检查：`GET /healthz` → `200 {"status":"ok"}`
 
 ---
 
@@ -163,7 +194,10 @@ curl -N "http://localhost:8080/api/events/stream?last_seq=0"
 
 - 顶部徽标显示连接状态：`连接中 / 补发断线期间事件 / 实时 / 已断开，自动重连中`；
 - 每条告警一张卡片，展示服务端序号 `#seq`、类型、门号与**设备时间**；
-- 「序号连续 · 屏幕完整」自检：若本地序号出现空洞（例如补发异常），会明确列出缺失序号，值班员可立刻判断屏幕是否完整。
+- 「序号连续 · 屏幕完整」自检：若本地序号出现空洞（例如补发异常），会明确列出缺失序号，值班员可立刻判断屏幕是否完整；
+- 时间线旁的**未关闭门面板**显示仍异常开启的门数量与详情（门号、异常开始/最近序号、最近类型、最近设备时间）：
+  接班时先加载一次，收到实时告警后刷新，断线补发完成（`replay-done`）后再校准一次；
+  快照接口失败只在面板区域提示并可手动重试（也会自动重试），**不中断**告警流与完整性判断。
 
 ## 验收服务 `verify`
 
@@ -183,14 +217,15 @@ curl -N "http://localhost:8080/api/events/stream?last_seq=0"
 
 ```
 backend/
-  main.go          HTTP 接口、校验、SSE 补发+实时续传
-  store.go         SQLite 存储、幂等写入、按 seq 补发
+  main.go          HTTP 接口、校验、SSE 补发+实时续传、未关闭门只读接口
+  store.go         SQLite 存储、幂等写入、按 seq 补发、事务内维护未关闭门视图与启动回算
   broker.go        实时事件扇出（慢消费者踢除，强制其走补发恢复）
-  store_test.go    存储/幂等/序号单调与重启不复用
+  store_test.go    存储/幂等/序号单调与重启不复用、未关闭门事务行为与历史回算
   sse_test.go      SSE 补发、实时、断线续传、边界恰好一次
+  active_api_test.go 未关闭门接口的固定顺序、报文形状与 405
   cmd/verify/      一次性验收程序
 frontend/
-  src/             Vue3 页面与 SSE 续传组合式函数
-  e2e/             Playwright：回调 → 页面全链路（含断网窗口）
+  src/             Vue3 页面、SSE 续传组合式函数、未关闭门快照组合式函数
+  e2e/             Playwright：回调 → 页面全链路（含断网窗口、未关闭门面板）
 docker-compose.yml api / web / verify 三服务，WEB_PORT、API_PORT 可覆盖
 ```

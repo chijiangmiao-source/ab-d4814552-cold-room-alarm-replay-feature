@@ -49,6 +49,7 @@ func main() {
 	mux.HandleFunc("/healthz", srv.handleHealth)
 	mux.HandleFunc("/api/events", srv.handleEvents)
 	mux.HandleFunc("/api/events/stream", srv.handleStream)
+	mux.HandleFunc("/api/doors/active", srv.handleActiveDoors)
 
 	addr := ":" + port
 	log.Printf("alarm API listening on %s (db=%s)", addr, dbPath)
@@ -80,6 +81,28 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleActiveDoors 是值班员接班视图：只读 GET，返回仍处于异常开启、尚未
+// CLOSED 的门（门号、开始/最近序号、最近告警类型、最近设备时间），按异常
+// 开始序号升序。查询失败复用与事件接口一致的 JSON 错误结构。
+func (s *Server) handleActiveDoors(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	doors, err := s.store.ActiveDoors(r.Context())
+	if err != nil {
+		log.Printf("query active doors: %v", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	if err := json.NewEncoder(w).Encode(doors); err != nil {
+		return
+	}
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {

@@ -159,3 +159,102 @@ test('新页面打开时从序号 0 完整补发历史', async ({ browser, reque
   await expect(page.getByTestId('completeness')).toContainText('序号连续')
   await ctx.close()
 })
+
+test('未关闭门：两门告警、关闭其一、断线补发后面板只保留另一门，时间线每条一次', async ({ browser, request }) => {
+  // 清场：把库里所有仍开着的门关掉，使面板计数只反映本场景，不依赖空库。
+  const active = await (await request.get('/api/doors/active')).json()
+  for (const d of active) {
+    await postEvent(request, `${RUN}-cleanup-${d.door_id}`, 'CLOSED', { door_id: d.door_id })
+  }
+
+  const ctx = await browser.newContext()
+  const page = await ctx.newPage()
+  await openConsole(page)
+
+  const doorA = `${RUN}-door-a`
+  const doorB = `${RUN}-door-b`
+  const panelRow = (door) => page.locator(`[data-testid="doors-panel"] li[data-door-id="${door}"]`)
+
+  // 两门先后告警：面板按异常开始序号列出两门。
+  const openA = await postEvent(request, `${RUN}-pa`, 'FORCED_OPEN', { door_id: doorA })
+  const openB = await postEvent(request, `${RUN}-pb`, 'OPEN_TOO_LONG', { door_id: doorB })
+  await waitForEventId(page, `${RUN}-pa`)
+  await waitForEventId(page, `${RUN}-pb`)
+  await expect(page.getByTestId('conn-badge')).toHaveText('实时')
+
+  await expect(panelRow(doorA)).toBeVisible()
+  await expect(panelRow(doorB)).toBeVisible()
+  await expect(page.getByTestId('doors-count')).toHaveText('2 扇')
+  await expect(panelRow(doorA)).toContainText('强制开门')
+  await expect(panelRow(doorA)).toContainText(`异常开始 #${openA.ev.seq}`)
+  await expect(panelRow(doorA)).toContainText(`最近 #${openA.ev.seq}`)
+  await expect(panelRow(doorB)).toContainText('开门超时')
+
+  // 关闭其中一门：实时刷新后只剩另一门。
+  await postEvent(request, `${RUN}-pa-close`, 'CLOSED', { door_id: doorA })
+  await expect(panelRow(doorA)).toHaveCount(0)
+  await expect(panelRow(doorB)).toBeVisible()
+  await expect(page.getByTestId('doors-count')).toHaveText('1 扇')
+
+  // 模拟中控断网：离线期间另一门再来告警，并夹杂一次重复回调。
+  await ctx.setOffline(true)
+  await page.waitForTimeout(300)
+  const updateB = await postEvent(request, `${RUN}-pb-2`, 'FORCED_OPEN', {
+    door_id: doorB,
+    occurred_at: '2026-09-14T23:30:00Z',
+  })
+  const dup = await postEvent(request, `${RUN}-pb`, 'CLOSED', { door_id: doorB })
+  expect(dup.dedup).toBe('true')
+  expect(dup.ev.seq).toBe(openB.ev.seq)
+
+  await page.waitForTimeout(1200)
+  await ctx.setOffline(false)
+
+  // 补发完成：时间线每条恰好一次，序号连续。
+  await waitForEventId(page, `${RUN}-pb-2`)
+  await expect(page.getByTestId('conn-badge')).toHaveText('实时', { timeout: 20_000 })
+  for (const id of [`${RUN}-pa`, `${RUN}-pb`, `${RUN}-pa-close`, `${RUN}-pb-2`]) {
+    await expect(page.locator(`article.event[data-event-id="${id}"]`)).toHaveCount(1)
+  }
+  await expect(page.getByTestId('completeness')).toContainText('序号连续')
+
+  // 补发校准后面板只保留另一门，且最近类型/序号已更新；被关闭的门不复活。
+  await expect(panelRow(doorA)).toHaveCount(0)
+  await expect(panelRow(doorB)).toBeVisible()
+  await expect(page.getByTestId('doors-count')).toHaveText('1 扇')
+  await expect(panelRow(doorB)).toContainText('强制开门')
+  await expect(panelRow(doorB)).toContainText(`异常开始 #${openB.ev.seq}`)
+  await expect(panelRow(doorB)).toContainText(`最近 #${updateB.ev.seq}`)
+
+  await ctx.close()
+})
+
+test('未关闭门快照失败只在面板内提示并可重试，不影响告警流与完整性判断', async ({ browser, request }) => {
+  const ctx = await browser.newContext()
+  // 只让快照接口失败，SSE 与事件回调不受影响。
+  await ctx.route('**/api/doors/active', (route) => route.fulfill({
+    status: 500,
+    contentType: 'application/json',
+    body: JSON.stringify({ error: 'internal error' }),
+  }))
+  const page = await ctx.newPage()
+  await openConsole(page)
+
+  await expect(page.getByTestId('doors-error')).toContainText('internal error')
+  await expect(page.getByTestId('doors-retry')).toBeVisible()
+
+  // 告警时间线照常工作，完整性判断照常。
+  const { ev } = await postEvent(request, `${RUN}-panel-down`, 'CLOSED')
+  const row = await waitForEventId(page, `${RUN}-panel-down`)
+  await expect(row).toContainText(`#${ev.seq}`)
+  await expect(page.getByTestId('conn-badge')).toHaveText('实时')
+  await expect(page.getByTestId('completeness')).toContainText('序号连续')
+
+  // 恢复接口后点击重试，错误从面板消失（列表或空态恢复展示）。
+  await ctx.unroute('**/api/doors/active')
+  await page.getByTestId('doors-retry').click()
+  await expect(page.getByTestId('doors-error')).toHaveCount(0)
+  await expect(page.locator('[data-testid="doors-empty"], [data-testid="doors-panel"] li').first()).toBeVisible()
+
+  await ctx.close()
+})

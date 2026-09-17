@@ -9,7 +9,10 @@
 
 import { ref, computed } from 'vue'
 
-export function useAlarmStream(baseUrl = '') {
+// hooks（可选）：
+//   onAlarm      每收到一条首次到达（去重后接受）的告警时触发——用于刷新未关闭门视图；
+//   onReplayDone 每次断线补发完成（replay-done）时触发——补发后再校准一次视图。
+export function useAlarmStream(baseUrl = '', hooks = {}) {
   const events = ref([])           // 已显示事件，按 seq 升序
   const connection = ref('connecting') // connecting | replaying | live | disconnected
   const lastSeq = ref(0)
@@ -40,7 +43,14 @@ export function useAlarmStream(baseUrl = '') {
 
     es.addEventListener('alarm', (e) => {
       try {
-        upsert(JSON.parse(e.data))
+        const ev = JSON.parse(e.data)
+        const before = lastSeq.value
+        upsert(ev)
+        // 只对补发结束后到达的实时新告警触发刷新；补发期的状态统一由
+        // replay-done 后的校准覆盖，避免整段历史逐条刷快照。
+        if (connection.value === 'live' && hooks.onAlarm && lastSeq.value > before) {
+          hooks.onAlarm(ev)
+        }
       } catch (err) {
         lastError.value = `无法解析事件帧: ${err.message}`
       }
@@ -51,6 +61,8 @@ export function useAlarmStream(baseUrl = '') {
       replayDoneAt.value = new Date().toISOString()
       connection.value = 'live'
       reconnectDelay = 500
+      // 断线补发完成后再校准一次未关闭门视图。
+      if (hooks.onReplayDone) hooks.onReplayDone()
     })
 
     es.onopen = () => {
